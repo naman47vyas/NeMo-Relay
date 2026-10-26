@@ -3470,6 +3470,12 @@ impl AtifDispatcher {
         }
         (agent.exporter.subscriber())(event);
         agent.observed_events.push(event.clone());
+        log::info!(
+            "DEBUG atif observe: event={} kind={:?} observed_count={}",
+            event.name(),
+            event.scope_category(),
+            agent.observed_events.len(),
+        );
         if !should_finalize || agent.written {
             return None;
         }
@@ -3987,10 +3993,12 @@ fn prepare_atif_payload(
             Some(value) => Map::from_iter([("trajectory_extra".to_string(), value)]),
             None => Map::new(),
         };
-        extra.insert(
-            "observed_events".to_string(),
-            serde_json::to_value(observed_events)?,
+        let observed_value = serde_json::to_value(observed_events)?;
+        log::info!(
+            "DEBUG atif payload: observed_events_bytes={}",
+            serde_json::to_vec(&observed_value)?.len(),
         );
+        extra.insert("observed_events".to_string(), observed_value);
         let mut nemo_relay = match extra.remove("nemo_relay") {
             Some(Json::Object(fields)) => fields,
             Some(value) => Map::from_iter([("trajectory_extra".to_string(), value)]),
@@ -4003,6 +4011,11 @@ fn prepare_atif_payload(
         object.insert("extra".to_string(), Json::Object(extra));
     }
     let payload = serde_json::to_vec_pretty(&value)?;
+    log::info!(
+        "DEBUG atif payload: pretty_bytes={} compact_bytes={}",
+        payload.len(),
+        serde_json::to_vec(&value)?.len(),
+    );
     Ok(PendingAtifWrite {
         agent_uuid,
         session_id,

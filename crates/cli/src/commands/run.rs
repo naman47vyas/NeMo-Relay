@@ -141,4 +141,5 @@ fn warn_for_possible_duplicate(agent: CodingAgent, command: &[String]) {
         arguments_redacted = true;
         "Possible duplicate agent executable after `--`; remove the repeated executable"
     );
+    log::info!("-------------------------------->DEBUG hit: {:?}", 69);
 }

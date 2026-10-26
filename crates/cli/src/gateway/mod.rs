@@ -285,6 +285,7 @@ pub(crate) async fn passthrough(
     state.touch();
     let operational = OperationalContext::new_gateway(request.headers_mut());
     let request_path = request.uri().path().to_string();
+    log::info!("DEBUG LLM request in: path={request_path}");
     let (authorization, provider_path) =
         state.authorize_provider_request(request.headers_mut(), &request_path)?;
     let mut prepared = match prepare_gateway_request(
@@ -313,7 +314,13 @@ pub(crate) async fn passthrough(
         .sessions
         .prepare_gateway_call(&prepared.headers, start)
         .await?;
-    run_managed_gateway(state, prepared, prep, operational).await
+    log::info!("DEBUG LLM forwarding: session={}", prep.session_id);
+    let result = run_managed_gateway(state, prepared, prep, operational).await;
+    match &result {
+        Ok(response) => log::info!("DEBUG LLM response out: status={}", response.status()),
+        Err(error) => log::info!("DEBUG LLM failed: {error}"),
+    }
+    result
 }
 
 /// Upgrades an authorized provider WebSocket without entering the managed LLM pipeline.

@@ -1543,6 +1543,11 @@ async fn claude_code_hook(
     let Json(payload) = payload.map_err(|error| {
         hook_payload_rejection(error, state.config.max_hook_payload_bytes, &operational)
     })?;
+    log::info!(
+        "DEBUG hook received: event={} tool={}",
+        payload["hook_event_name"].as_str().unwrap_or("?"),
+        payload["tool_name"].as_str().unwrap_or("-"),
+    );
     let outcome = claude_code::adapt(payload, &headers);
     let operational = outcome
         .events

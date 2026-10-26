@@ -1998,6 +1998,219 @@ async fn serve_listener_activates_plugin_config_and_clears_on_shutdown() {
     );
 }
 
+// Walkthrough test: replays one Claude Code `ls` turn (hooks and model calls) through the real
+// gateway, so a debugger can follow both the hook path and the LLM path into the ATIF file write.
+#[tokio::test]
+async fn walkthrough_claude_code_turn_writes_atif() {
+    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let _ = nemo_relay::plugin::test_close_plugin_host();
+
+    // Stands in for api.anthropic.com: every /v1/messages call gets the same canned reply.
+    async fn anthropic_messages() -> TestServer {
+        async fn messages(_headers: HeaderMap, _request: Request<Body>) -> impl IntoResponse {
+            Json(json!({
+                "id": "msg_01",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4",
+                "content": [
+                    {"type": "text", "text": "I will list it."},
+                    {"type": "tool_use", "id": "toolu_walkthrough", "name": "Bash", "input": {"command": "ls crates"}}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 11, "output_tokens": 7}
+            }))
+        }
+
+        let app = Router::new().route("/v1/messages", post(messages));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestServer {
+            url: format!("http://{address}"),
+            handle,
+        }
+    }
+
+    // What Claude Code sends to /hooks/claude-code.
+    async fn send_hook(client: &reqwest::Client, url: &str, session_id: &str, mut hook: Value) {
+        hook["session_id"] = json!(session_id);
+        let response = client
+            .post(format!("{url}/hooks/claude-code"))
+            .json(&hook)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "hook {hook}");
+    }
+
+    // What Claude Code sends to the model, through the gateway.
+    async fn send_llm(client: &reqwest::Client, url: &str, session_id: &str, messages: &[Value]) {
+        let response = client
+            .post(format!("{url}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "sk-ant-test")
+            .header("x-nemo-relay-session-id", session_id)
+            .json(&json!({
+                "model": "claude-sonnet-4",
+                "messages": messages,
+                "tools": [{"name": "Bash", "input_schema": {"type": "object"}}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let atif_dir = temp.path().join("atif");
+    std::fs::create_dir_all(&atif_dir).unwrap();
+    let anthropic_upstream = anthropic_messages().await;
+    let mut config = test_config();
+    config.anthropic_base_url = anthropic_upstream.url();
+    config.plugin_config = Some(json!({
+        "version": 1,
+        "components": [{
+            "kind": "observability",
+            "enabled": true,
+            "config": {
+                "version": 4,
+                "atif": {
+                    "enabled": true,
+                    "output_directory": atif_dir,
+                    "filename_template": "trajectory-{session_id}.json"
+                }
+            }
+        }]
+    }));
+
+    // 1. Start the real gateway on a random local port.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle =
+        tokio::spawn(async move { serve_listener(listener, config, Some(shutdown_rx)).await });
+    wait_for_gateway(&url).await;
+
+    // 2. Replay "list the crates folder" in the order Claude Code sends it.
+    let session_id = "walkthrough-session";
+    let client = test_http_client();
+    let mut messages = vec![json!({"role": "user", "content": "list the crates folder"})];
+
+    send_hook(
+        &client,
+        &url,
+        session_id,
+        json!({"hook_event_name": "SessionStart"}),
+    )
+    .await;
+    send_hook(
+        &client,
+        &url,
+        session_id,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "list the crates folder"}),
+    )
+    .await;
+
+    // LLM call 1: the model decides to run Bash.
+    send_llm(&client, &url, session_id, &messages).await;
+
+    send_hook(
+        &client,
+        &url,
+        session_id,
+        json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_walkthrough",
+            "tool_input": {"command": "ls crates"}
+        }),
+    )
+    .await;
+    send_hook(
+        &client,
+        &url,
+        session_id,
+        json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_walkthrough",
+            "tool_input": {"command": "ls crates"},
+            "tool_response": {"stdout": "cli\ncore\n", "stderr": ""}
+        }),
+    )
+    .await;
+
+    // The history grows: Claude re-sends everything plus the tool call and its result.
+    messages.push(json!({"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_walkthrough", "name": "Bash", "input": {"command": "ls crates"}}
+    ]}));
+    messages.push(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_walkthrough", "content": "cli\ncore\n"}
+    ]}));
+
+    // LLM call 2: the model writes the final answer.
+    send_llm(&client, &url, session_id, &messages).await;
+
+    send_hook(
+        &client,
+        &url,
+        session_id,
+        json!({"hook_event_name": "Stop"}),
+    )
+    .await;
+    send_hook(
+        &client,
+        &url,
+        session_id,
+        json!({"hook_event_name": "SessionEnd"}),
+    )
+    .await;
+
+    // 3. Stop the gateway so every trajectory is flushed to disk.
+    shutdown_tx.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+
+    // 4. Read the ATIF file back and check both the Bash call and the LLM calls were recorded.
+    let trajectories = std::fs::read_dir(&atif_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            serde_json::from_slice::<Value>(&std::fs::read(entry.path()).ok()?).ok()
+        })
+        .collect::<Vec<_>>();
+    let turn = trajectories
+        .iter()
+        .find(|trajectory| {
+            trajectory["extra"]["observed_events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|event| event["name"] == json!("Bash")))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a trajectory containing the Bash tool call: {}",
+                serde_json::to_string_pretty(&trajectories).unwrap()
+            )
+        });
+    let llm_starts = turn["extra"]["observed_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event["name"] == json!("anthropic.messages")
+                && event["scope_category"] == json!("start")
+        })
+        .count();
+    assert_eq!(
+        llm_starts,
+        2,
+        "expected both LLM calls in the Bash turn: {}",
+        serde_json::to_string_pretty(turn).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn terminal_hook_responses_wait_for_their_atif_snapshot() {
     let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
